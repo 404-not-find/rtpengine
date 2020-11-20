@@ -443,18 +443,33 @@ static struct rtp_payload_type *__check_dest_codecs(struct call_media *receiver,
 			pref_dest_codec = pt;
 		}
 
+
 		// also check if this is a transcoding codec: if we can send a codec to the sink,
 		// but can't receive it on the receiver side, then it's transcoding. this is to check
 		// whether transcoding on the sink side is actually needed. if transcoding has been
 		// previously enabled on the sink, but no transcoding codecs are actually present,
 		// we can disable the transcoding engine.
+		struct rtp_payload_type *recv_pt = g_hash_table_lookup(receiver->codecs_send,
+				&pt->payload_type);
+		if (recv_pt && rtp_payload_type_cmp(pt, recv_pt))
+			recv_pt = NULL;
+		ilog(LOG_DEBUG, "XXXXXXXXXXXX checking dest codec " STR_FORMAT " is %i",
+				STR_FMT(&pt->encoding_with_params),
+				pt->for_transcoding);
+		if (recv_pt)
+			ilog(LOG_DEBUG, "XXXXXXXXXXXX checking dest codec reverse " STR_FORMAT " is %i",
+					STR_FMT(&recv_pt->encoding_with_params),
+					recv_pt->for_transcoding);
 		if (MEDIA_ISSET(sink, TRANSCODE)) {
-			struct rtp_payload_type *recv_pt = g_hash_table_lookup(receiver->codecs_send,
-					&pt->payload_type);
-			if (!recv_pt || rtp_payload_type_cmp(pt, recv_pt)) {
-				// can the sink receive supplemental codec but the receiver can't send it?
+			if (!recv_pt) {
+				// can the sink receive codec but the receiver can't send it?
 				*sink_transcoding |= 0x3;
 			}
+		}
+		else if (pt->for_transcoding) {
+			// codec is explicitly marked for transcoding. enable transcoding engine
+			MEDIA_SET(receiver, TRANSCODE);
+			*sink_transcoding |= 0x3;
 		}
 
 		__track_supp_codec(supplemental_sinks, pt);
@@ -474,10 +489,19 @@ static void __check_send_codecs(struct call_media *receiver, struct call_media *
 		struct rtp_payload_type *recv_pt = g_hash_table_lookup(receiver->codecs_send,
 				&pt->payload_type);
 		int tc_flag = 0;
+		ilog(LOG_DEBUG, "XXXXXXXXXXXX checking send codec " STR_FORMAT " is %i",
+				STR_FMT(&pt->encoding_with_params),
+				pt->for_transcoding);
+		if (recv_pt)
+			ilog(LOG_DEBUG, "XXXXXXXXXXXX checking send codec reverse " STR_FORMAT " is %i",
+					STR_FMT(&recv_pt->encoding_with_params),
+					recv_pt->for_transcoding);
 		if (!recv_pt || rtp_payload_type_cmp(pt, recv_pt))
 			tc_flag |= 0x3;
 		if (flags && flags->inject_dtmf)
 			tc_flag |= 0x1;
+		if (pt->for_transcoding)
+			tc_flag |= 0x3;
 		if (tc_flag) {
 			// can the sink receive codec but the receiver can't send it?
 			*sink_transcoding |= tc_flag;
@@ -1208,10 +1232,19 @@ void codec_handlers_update(struct call_media *receiver, struct call_media *sink,
 			goto next;
 		}
 
+		ilog(LOG_DEBUG, "XXXXXXXXXXXX pref dest codec " STR_FORMAT " is %i",
+				STR_FMT(&pref_dest_codec->encoding_with_params),
+				pref_dest_codec->for_transcoding);
+
 		struct rtp_payload_type *dest_pt; // transcode to this
 
 		GQueue *dest_codecs = NULL;
-		if (!flags || !flags->always_transcode) {
+		if (pref_dest_codec->for_transcoding) {
+			// with always-transcode, we still accept DTMF payloads if possible
+			if (pt->codec_def && pt->codec_def->supplemental)
+				dest_codecs = g_hash_table_lookup(sink->codec_names_send, &pt->encoding);
+		}
+		else if (!flags || !flags->always_transcode) {
 			// we ignore output codec matches if we must transcode supp codecs
 			if (dtmf_pt_match == 1 || cn_pt_match == 1)
 				;
@@ -3092,7 +3125,7 @@ void codec_rtp_payload_types(struct call_media *media, struct call_media *other_
 	static const str str_full = STR_CONST_INIT("full");
 	GHashTable *stripped = g_hash_table_new_full(str_case_hash, str_case_equal, free, __payload_queue_free);
 	GHashTable *masked = g_hash_table_new_full(str_case_hash, str_case_equal, free, __payload_queue_free);
-	int strip_all = 0, mask_all = 0;
+	int strip_all = 0, mask_all = 0, consume_all = 0;
 
 	// start fresh
 	if (!proto_is_rtp(other_media->protocol) && proto_is_rtp(media->protocol) && flags->opmode == OP_OFFER) {
@@ -3115,12 +3148,16 @@ void codec_rtp_payload_types(struct call_media *media, struct call_media *other_
 
 	if (flags->codec_strip && g_hash_table_lookup(flags->codec_strip, &str_all))
 		strip_all = 1;
-	if (flags->codec_strip && g_hash_table_lookup(flags->codec_strip, &str_all))
+	else if (flags->codec_strip && g_hash_table_lookup(flags->codec_strip, &str_full))
 		strip_all = 2;
 	if (flags->codec_mask && g_hash_table_lookup(flags->codec_mask, &str_all))
 		mask_all = 1;
 	else if (flags->codec_mask && g_hash_table_lookup(flags->codec_mask, &str_full))
 		mask_all = 2;
+	if (flags->codec_consume && g_hash_table_lookup(flags->codec_consume, &str_all))
+		consume_all = 1;
+	else if (flags->codec_consume && g_hash_table_lookup(flags->codec_consume, &str_full))
+		consume_all = 2;
 
 	/* we steal the entire list to avoid duplicate allocs */
 	while ((pt = g_queue_pop_head(types))) {
@@ -3154,6 +3191,28 @@ void codec_rtp_payload_types(struct call_media *media, struct call_media *other_
 			q = g_hash_table_lookup_queue_new(masked, str_dup(&pt->encoding_with_params), free);
 			g_queue_push_tail(q, __rtp_payload_type_copy(pt));
 			__rtp_payload_type_add_send(other_media, pt);
+		}
+		else if (__codec_ht_except(consume_all, flags->codec_consume, flags->codec_except, pt)) {
+			ilog(LOG_DEBUG, "Consuming codec '" STR_FORMAT "'",
+					STR_FMT(&pt->encoding_with_params));
+#ifdef WITH_TRANSCODING
+			codec_touched(pt, media);
+#endif
+			pt->for_transcoding = 1;
+			GQueue *q = g_hash_table_lookup_queue_new(masked, str_dup(&pt->encoding), free);
+			g_queue_push_tail(q, __rtp_payload_type_copy(pt));
+			q = g_hash_table_lookup_queue_new(masked, str_dup(&pt->encoding_with_params), free);
+			g_queue_push_tail(q, __rtp_payload_type_copy(pt));
+			__rtp_payload_type_add_send(other_media, pt);
+		}
+		else if (__codec_ht_except(0, flags->codec_accept, NULL, pt)) {
+			ilog(LOG_DEBUG, "Accepting codec '" STR_FORMAT "'",
+					STR_FMT(&pt->encoding_with_params));
+#ifdef WITH_TRANSCODING
+			codec_touched(pt, media);
+#endif
+			pt->for_transcoding = 1;
+			__rtp_payload_type_add(media, other_media, pt);
 		}
 		else
 			__rtp_payload_type_add(media, other_media, pt);
